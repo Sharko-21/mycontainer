@@ -5,12 +5,9 @@ import (
 	"log/slog"
 	"mycontainer/logging"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
-	"time"
 )
 
 func NewCommander(logger logging.Logger) (Commander, error) {
@@ -33,6 +30,9 @@ type commander struct {
 	cpuRequest    int
 	cpuLimit      int
 	cpuPeriod     int
+	containerID   string
+
+	listAll bool
 
 	logging logging.Logger
 }
@@ -49,176 +49,19 @@ func (c *commander) Parse() error {
 		return fmt.Errorf("no command specified")
 	}
 	switch c.args[0] {
-	case runCommand:
-		return c.run()
+	case listCommand:
+		return c.list()
+	case deleteCommand:
+		return c.delete()
+	case createCommand:
+		return c.create()
+	case startCommand:
+		return c.start()
 	case childCommand:
 		return c.child()
 	default:
 		return fmt.Errorf("unknown command: %s", c.args[0])
 	}
-}
-
-func (c *commander) run() error {
-	if len(c.args) == 1 {
-		return fmt.Errorf("no command specified")
-	}
-	commands := []string{childCommand}
-	if c.rootfs != "" {
-		commands = append(commands, "--rootfs", c.rootfs)
-	}
-	if c.debug {
-		commands = append(commands, "--debug")
-	}
-
-	commands = append(commands, "--memory-limit", strconv.Itoa(c.memoryLimit))
-	commands = append(commands, "--memory-request", strconv.Itoa(c.memoryRequest))
-	commands = append(commands, "--cpu-request", strconv.Itoa(c.cpuRequest))
-
-	if c.cpuLimit == -1 {
-		commands = append(commands, "--cpu-limit", "max", strconv.Itoa(c.cpuPeriod))
-	} else {
-		commands = append(commands, "--cpu-limit", strconv.Itoa(c.cpuLimit), strconv.Itoa(c.cpuPeriod))
-	}
-	defer func() {
-		for i := 0; i < 3; i++ {
-			time.Sleep(100 * time.Microsecond)
-			if _, err := os.Stat(cgroupPath); err == nil {
-				c.logging.Debugf("[host] Container finished. Cleaning up cgroup: %s", cgroupPath)
-				if err = os.Remove(cgroupPath); err != nil {
-					c.logging.Debugf("[host] Warning: failed to remove cgroup dir: %v", err)
-					continue
-				}
-				c.logging.Debug("[host] Cgroup cleaned up successfully!")
-				return
-			}
-		}
-	}()
-	cmd := exec.Command("/proc/self/exe", append(commands, c.args[1:]...)...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS,
-	}
-	return cmd.Run()
-}
-
-func (c *commander) child() error {
-	if err := c.createCgroups(); err != nil {
-		return err
-	}
-	if err := syscall.Sethostname([]byte("my-container")); err != nil {
-		return err
-	}
-	if err := c.mountRootFS(); err != nil {
-		return err
-	}
-	cmd := exec.Command(c.args[1], c.args[2:]...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Env = []string{
-		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-		"TERM=xterm", // Чтобы работали clear и стрелочки
-	}
-	return cmd.Run()
-}
-
-func (c *commander) createCgroups() error {
-	if err := os.MkdirAll(cgroupPath, 0755); err != nil {
-		return err
-	}
-	if err := os.WriteFile(
-		filepath.Join(cgroupPath, "memory.max"), []byte(strconv.Itoa(c.memoryLimit)), 0644,
-	); err != nil {
-		return err
-	}
-	if err := os.WriteFile(
-		filepath.Join(cgroupPath, "memory.low"), []byte(strconv.Itoa(c.memoryRequest)), 0644,
-	); err != nil {
-		return err
-	}
-	if err := os.WriteFile(
-		filepath.Join(cgroupPath, "cpu.weight"), []byte(strconv.Itoa(c.cpuRequest)), 0644,
-	); err != nil {
-		return err
-	}
-	if err := os.WriteFile(
-		filepath.Join(cgroupPath, "pids.max"), []byte("100"), 0644,
-	); err != nil {
-		return err
-	}
-	var cpuMaxStr string
-	if c.cpuLimit == -1 {
-		cpuMaxStr = fmt.Sprintf("max %d", c.cpuPeriod)
-	} else {
-		cpuMaxStr = fmt.Sprintf("%d %d", c.cpuLimit, c.cpuPeriod)
-	}
-	if err := os.WriteFile(filepath.Join(cgroupPath, "cpu.max"), []byte(cpuMaxStr), 0644); err != nil {
-		return fmt.Errorf("failed to write cpu.max: %w", err)
-	}
-	pidStr := strconv.Itoa(os.Getpid())
-	if err := os.WriteFile(filepath.Join(cgroupPath, "cgroup.procs"), []byte(pidStr), 0644); err != nil {
-		return fmt.Errorf("failed to move process to cgroup (cgroup.procs): %w", err)
-	}
-	return nil
-}
-
-func (c *commander) mountRootFS() error {
-	if c.rootfs == "" {
-		return fmt.Errorf("no rootfs specified")
-	}
-
-	// ХАК ДЛЯ SYSTEMD (Критично для pivot_root!):
-	// Делаем ВЕСЬ корень "/" внутри этого namespace приватным.
-	// Это отвязывает пространство монтирования контейнера от хоста.
-	if err := syscall.Mount("", "/", "", syscall.MS_PRIVATE|syscall.MS_REC, ""); err != nil {
-		return fmt.Errorf("failed to make root mount private: %w", err)
-	}
-
-	// Шаг 1: Bind Mount rootfs на саму себя. Теперь это честный mount point.
-	if err := syscall.Mount(c.rootfs, c.rootfs, "", syscall.MS_BIND, ""); err != nil {
-		return fmt.Errorf("step 1 (bind mount) failed: %w", err)
-	}
-
-	// Шаг 2: Создание директории для отката старой FS хоста.
-	// filepath.Join соберет правильный путь, например: /home/yaroslav/alpine_rootfs/.put_old
-	putOldDir := filepath.Join(c.rootfs, ".put_old")
-	if err := os.MkdirAll(putOldDir, 0700); err != nil {
-		return fmt.Errorf("step 2 (mkdir .put_old) failed: %w", err)
-	}
-
-	// Шаг 3: Смена корня местами. Старый корень улетает в .put_old
-	if err := syscall.PivotRoot(c.rootfs, putOldDir); err != nil {
-		return fmt.Errorf("step 3 (pivot_root) failed: %w", err)
-	}
-
-	// Шаг 4: Сдвигаем рабочую директорию процесса в новый, честный корень "/"
-	if err := os.Chdir("/"); err != nil {
-		return fmt.Errorf("step 4 (chdir to /) failed: %w", err)
-	}
-
-	// Шаг 5: Монтируем изолированный /proc
-	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
-		return fmt.Errorf("step 5 (mount /proc) failed: %w", err)
-	}
-
-	if err := syscall.Mount("sysfs", "/sys", "sysfs", 0, ""); err != nil {
-		return fmt.Errorf("step 5.5 (mount /sys) failed: %w", err)
-	}
-
-	// Шаг 6: Лениво отмонтируем старую хостовую FS, которая сейчас лежит в /.put_old
-	// Флаг MNT_DETACH полностью скрывает её из видимости контейнера
-	if err := syscall.Unmount("/.put_old", syscall.MNT_DETACH); err != nil {
-		return fmt.Errorf("step 6 (unmount /.put_old) failed: %w", err)
-	}
-
-	// Шаг 7: Удаляем за собой временную папку. Теперь она пустая и доступна для удаления.
-	if err := os.Remove("/.put_old"); err != nil {
-		return fmt.Errorf("step 7 (remove /.put_old) failed: %w", err)
-	}
-
-	return nil
 }
 
 func (c *commander) parseArgs() error {
@@ -230,6 +73,34 @@ func (c *commander) parseArgs() error {
 	c.cpuRequest = cpuRequestDefault
 	c.cpuLimit = cpuLimitDefault
 	c.cpuPeriod = cpuPeriodDefault
+	if len(c.args) <= 0 {
+		return fmt.Errorf("no command specified")
+	}
+	if c.args[0] == deleteCommand {
+		if len(c.args) < 2 {
+			return fmt.Errorf("no container_id specified")
+		}
+		c.containerID = c.args[1]
+	}
+	if c.args[0] == startCommand {
+		if len(c.args) < 2 {
+			return fmt.Errorf("no container_id specified")
+		}
+		c.containerID = c.args[1]
+	}
+	if c.args[0] == listCommand {
+		if len(c.args) >= 2 && c.args[1] == "--all" {
+			c.listAll = true
+		}
+	}
+
+	if c.args[0] == childCommand {
+		if len(c.args) < 2 {
+			return fmt.Errorf("no container_id specified")
+		}
+		c.containerID = c.args[1]
+	}
+
 	for i, arg := range c.args {
 		if skipArgs > 0 {
 			skipArgs = skipArgs - 1
@@ -323,7 +194,6 @@ func (c *commander) parseArgs() error {
 		args = append(args, arg)
 	}
 	c.args = args
-	c.logging.Debugf("args: %v", args)
 	c.logging.Debugf("args: %v", c.args)
 	c.logging.Debugf("memoryLimit: %d", c.memoryLimit)
 	c.logging.Debugf("memoryRequest: %d", c.memoryRequest)
@@ -333,9 +203,16 @@ func (c *commander) parseArgs() error {
 	return nil
 }
 
+func (c *commander) getCgroupPath(containerID string) string {
+	return filepath.Join("/sys/fs/cgroup/system.slice", "mycontainer-"+containerID)
+}
+
 // commands for execution
-const runCommand = "run"
+const startCommand = "start"
+const createCommand = "create"
+const listCommand = "list"
 const childCommand = "child"
+const deleteCommand = "delete"
 
 // execution params
 const rootfsParam = "rootfs"
@@ -344,9 +221,6 @@ const memoryRequestParam = "memory-request"
 const cpuLimitParam = "cpu-limit"
 const cpuRequestParam = "cpu-request"
 const debugParam = "debug"
-
-// path
-const cgroupPath = "/sys/fs/cgroup/my-container"
 
 // default limits
 const memoryLimitDefault = 536870912 // 512MB
