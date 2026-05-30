@@ -27,6 +27,7 @@ func parseCommand(targetCmd string) ([]string, error) {
 }
 
 func (c *commander) child() error {
+	// TODO переделать временный костыль на синхронизацию через pipe
 	time.Sleep(1 * time.Second)
 	cont, err := store.GetContainerByID(c.containerID)
 	if err != nil {

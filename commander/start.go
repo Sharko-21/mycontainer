@@ -24,7 +24,7 @@ func (c *commander) collectCommands() ([]string, error) {
 }
 
 func (c *commander) clearCgroup(containerID string) {
-	cgroupPath := filepath.Join("/sys/fs/cgroup/system.slice", "mycontainer-"+containerID)
+	cgroupPath := filepath.Join("/sys/fs/cgroup", "mycontainer-"+containerID)
 	for i := 0; i < 3; i++ {
 		time.Sleep(100 * time.Microsecond)
 		if _, err := os.Stat(cgroupPath); err == nil {

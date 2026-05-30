@@ -204,7 +204,7 @@ func (c *commander) parseArgs() error {
 }
 
 func (c *commander) getCgroupPath(containerID string) string {
-	return filepath.Join("/sys/fs/cgroup/system.slice", "mycontainer-"+containerID)
+	return filepath.Join("/sys/fs/cgroup", "mycontainer-"+containerID)
 }
 
 // commands for execution
